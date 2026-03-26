@@ -1,6 +1,7 @@
 import axios from 'axios'
-import { inflateRawSync } from 'node:zlib'
+import { createHash } from 'node:crypto'
 import { TextSplitter } from '@langchain/textsplitters'
+import * as yauzl from 'yauzl'
 import { getFileFromStorage, handleEscapeCharacters, INodeOutputsValue } from '../../../src'
 import { ICommonObject, IDocument, INode, INodeData, INodeParams } from '../../../src/Interface'
 
@@ -65,6 +66,9 @@ const PRECISION_ALLOWED_FORMATS_TEXT = '.pdf, images, .DOC, .DOCX, .PPT, .PPTX, 
 
 const POLL_MIN_INTERVAL_MS = 2000
 const POLL_MAX_INTERVAL_MS = 30000
+const DEFAULT_TASK_CONCURRENCY = 3
+const MAX_ZIP_BUFFER_BYTES = 100 * 1024 * 1024
+const MAX_MARKDOWN_BYTES = 20 * 1024 * 1024
 
 const MIME_EXTENSION_MAP: Record<string, string> = {
     'application/pdf': 'pdf',
@@ -318,11 +322,7 @@ class MinerU_DocumentLoaders implements INode {
                 ? await this.buildFileTasks(nodeData, options, mode, pageRange, splitPages)
                 : this.buildUrlTasks(nodeData, mode, pageRange, splitPages)
 
-        const results: MinerUTaskResult[] = []
-        for (const task of tasks) {
-            const result = await this.runTask(task, config)
-            results.push(result)
-        }
+        const results = await this.runTasksWithConcurrency(tasks, config, DEFAULT_TASK_CONCURRENCY)
 
         let docs: IDocument[] = results
             .filter((r) => r.markdown)
@@ -395,6 +395,21 @@ class MinerU_DocumentLoaders implements INode {
             formula,
             table
         }
+    }
+
+    private async runTasksWithConcurrency(tasks: SourceTask[], config: MinerUConfig, concurrency: number): Promise<MinerUTaskResult[]> {
+        if (!tasks.length) return []
+
+        const safeConcurrency = Number.isFinite(concurrency) && concurrency > 0 ? Math.floor(concurrency) : 1
+        const results: MinerUTaskResult[] = []
+
+        for (let i = 0; i < tasks.length; i += safeConcurrency) {
+            const batch = tasks.slice(i, i + safeConcurrency)
+            const batchResults = await Promise.all(batch.map((task) => this.runTask(task, config)))
+            results.push(...batchResults)
+        }
+
+        return results
     }
 
     private buildUrlTasks(nodeData: INodeData, mode: MinerUMode, pageRange: string, splitPages: boolean): SourceTask[] {
@@ -520,12 +535,18 @@ class MinerU_DocumentLoaders implements INode {
 
         const mimeMatch = contentPart.match(/^data:([^;]+);base64,/i)
         const ext = mimeMatch?.[1] ? MIME_EXTENSION_MAP[mimeMatch[1].toLowerCase()] || 'bin' : 'bin'
-        const guessedName = fileNameFromPayload || `upload_${Date.now()}_${index}.${ext}`
+        const guessedName = fileNameFromPayload || this.buildDeterministicUploadName(buffer, index, ext)
 
         return {
             fileName: guessedName,
             buffer
         }
+    }
+
+    private buildDeterministicUploadName(buffer: Buffer, index: number, ext: string): string {
+        const digest = createHash('sha256').update(buffer).digest('hex').slice(0, 16)
+        const safeExt = ext || 'bin'
+        return `upload_${digest}_${index}.${safeExt}`
     }
 
     private async runTask(task: SourceTask, config: MinerUConfig): Promise<MinerUTaskResult> {
@@ -807,84 +828,167 @@ class MinerU_DocumentLoaders implements INode {
         return this.extractMarkdownFromZip(zipBuffer, source)
     }
 
-    private extractMarkdownFromZip(zipBuffer: Buffer, source: string): string {
-        const eocdOffset = this.findEndOfCentralDirectory(zipBuffer)
-        const centralDirectorySize = zipBuffer.readUInt32LE(eocdOffset + 12)
-        const centralDirectoryOffset = zipBuffer.readUInt32LE(eocdOffset + 16)
-        const centralDirectoryEnd = centralDirectoryOffset + centralDirectorySize
-
-        let cursor = centralDirectoryOffset
-        while (cursor + 46 <= centralDirectoryEnd && cursor + 46 <= zipBuffer.length) {
-            const centralSignature = zipBuffer.readUInt32LE(cursor)
-            if (centralSignature !== 0x02014b50) break
-
-            const compressionMethod = zipBuffer.readUInt16LE(cursor + 10)
-            const compressedSize = zipBuffer.readUInt32LE(cursor + 20)
-            const fileNameLength = zipBuffer.readUInt16LE(cursor + 28)
-            const extraFieldLength = zipBuffer.readUInt16LE(cursor + 30)
-            const fileCommentLength = zipBuffer.readUInt16LE(cursor + 32)
-            const localHeaderOffset = zipBuffer.readUInt32LE(cursor + 42)
-
-            const fileNameStart = cursor + 46
-            const fileNameEnd = fileNameStart + fileNameLength
-            if (fileNameEnd > zipBuffer.length) {
-                throw new Error(`MinerU precision mode zip is invalid for ${source}`)
-            }
-            const fileName = zipBuffer.subarray(fileNameStart, fileNameEnd).toString('utf-8')
-
-            if (fileName.toLowerCase().endsWith('.md')) {
-                const markdownBuffer = this.readZipEntry(zipBuffer, localHeaderOffset, compressedSize, compressionMethod, source)
-                return markdownBuffer.toString('utf-8')
-            }
-
-            cursor = fileNameEnd + extraFieldLength + fileCommentLength
+    private async extractMarkdownFromZip(zipBuffer: Buffer, source: string): Promise<string> {
+        if (zipBuffer.length > MAX_ZIP_BUFFER_BYTES) {
+            throw new Error(`MinerU precision mode zip is too large for ${source} (limit: ${MAX_ZIP_BUFFER_BYTES} bytes)`)
         }
 
-        throw new Error(`MinerU precision mode zip has no markdown file for ${source}`)
+        const zipFile = await this.openZipFromBuffer(zipBuffer, source)
+        try {
+            return await this.readFirstMarkdownEntry(zipFile, source)
+        } finally {
+            zipFile.close()
+        }
     }
 
-    private findEndOfCentralDirectory(zipBuffer: Buffer): number {
-        const minOffset = Math.max(0, zipBuffer.length - 65557)
-        for (let i = zipBuffer.length - 22; i >= minOffset; i -= 1) {
-            if (zipBuffer.readUInt32LE(i) === 0x06054b50) {
-                return i
-            }
-        }
-        throw new Error('MinerU precision mode zip parse failed: EOCD not found')
+    private openZipFromBuffer(zipBuffer: Buffer, source: string): Promise<yauzl.ZipFile> {
+        return new Promise((resolve, reject) => {
+            yauzl.fromBuffer(zipBuffer, { lazyEntries: true, decodeStrings: true, validateEntrySizes: true }, (err, zipFile) => {
+                if (err || !zipFile) {
+                    reject(new Error(`MinerU precision mode zip parse failed for ${source}: ${err?.message || 'unknown error'}`))
+                    return
+                }
+                resolve(zipFile)
+            })
+        })
     }
 
-    private readZipEntry(
-        zipBuffer: Buffer,
-        localHeaderOffset: number,
-        compressedSize: number,
-        compressionMethod: number,
-        source: string
-    ): Buffer {
-        if (localHeaderOffset + 30 > zipBuffer.length) {
-            throw new Error(`MinerU precision mode zip local header out of range for ${source}`)
-        }
+    private readFirstMarkdownEntry(zipFile: yauzl.ZipFile, source: string): Promise<string> {
+        return new Promise((resolve, reject) => {
+            let isSettled = false
 
-        const localSignature = zipBuffer.readUInt32LE(localHeaderOffset)
-        if (localSignature !== 0x04034b50) {
-            throw new Error(`MinerU precision mode invalid local header signature for ${source}`)
-        }
+            const fail = (err: Error): void => {
+                if (isSettled) return
+                isSettled = true
+                cleanup()
+                reject(err)
+            }
 
-        const fileNameLength = zipBuffer.readUInt16LE(localHeaderOffset + 26)
-        const extraFieldLength = zipBuffer.readUInt16LE(localHeaderOffset + 28)
-        const dataStart = localHeaderOffset + 30 + fileNameLength + extraFieldLength
-        const dataEnd = dataStart + compressedSize
-        if (dataEnd > zipBuffer.length) {
-            throw new Error(`MinerU precision mode zip entry out of range for ${source}`)
-        }
+            const succeed = (markdown: string): void => {
+                if (isSettled) return
+                isSettled = true
+                cleanup()
+                resolve(markdown)
+            }
 
-        const compressedData: Buffer = Buffer.from(zipBuffer.subarray(dataStart, dataEnd))
-        if (compressionMethod === 0) {
-            return compressedData
-        }
-        if (compressionMethod === 8) {
-            return inflateRawSync(compressedData)
-        }
-        throw new Error(`MinerU precision mode unsupported zip compression method: ${compressionMethod}`)
+            const cleanup = (): void => {
+                zipFile.removeListener('entry', onEntry)
+                zipFile.removeListener('error', onError)
+                zipFile.removeListener('end', onEnd)
+            }
+
+            const onError = (err: Error): void => {
+                fail(new Error(`MinerU precision mode zip parse failed for ${source}: ${err.message}`))
+            }
+
+            const onEnd = (): void => {
+                fail(new Error(`MinerU precision mode zip has no markdown file for ${source}`))
+            }
+
+            const onEntry = (entry: yauzl.Entry): void => {
+                const fileName = entry.fileName || ''
+
+                if (/\/$/.test(fileName) || !this.isMarkdownEntry(fileName)) {
+                    zipFile.readEntry()
+                    return
+                }
+
+                if (entry.uncompressedSize > MAX_MARKDOWN_BYTES) {
+                    fail(
+                        new Error(
+                            `MinerU precision mode markdown entry exceeds size limit for ${source} (limit: ${MAX_MARKDOWN_BYTES} bytes)`
+                        )
+                    )
+                    return
+                }
+
+                zipFile.openReadStream(entry, (err, stream) => {
+                    if (err || !stream) {
+                        fail(
+                            new Error(
+                                `MinerU precision mode failed to read markdown entry for ${source}: ${err?.message || 'unknown error'}`
+                            )
+                        )
+                        return
+                    }
+
+                    this.readEntryBufferWithLimit(stream, MAX_MARKDOWN_BYTES, source)
+                        .then((buffer) => {
+                            succeed(buffer.toString('utf-8'))
+                        })
+                        .catch((readErr: Error) => {
+                            fail(readErr)
+                        })
+                })
+            }
+
+            zipFile.on('entry', onEntry)
+            zipFile.on('error', onError)
+            zipFile.on('end', onEnd)
+            zipFile.readEntry()
+        })
+    }
+
+    private readEntryBufferWithLimit(stream: NodeJS.ReadableStream, maxBytes: number, source: string): Promise<Buffer> {
+        return new Promise((resolve, reject) => {
+            const chunks: Buffer[] = []
+            let totalBytes = 0
+            let isSettled = false
+
+            const fail = (err: Error): void => {
+                if (isSettled) return
+                isSettled = true
+                cleanup()
+                reject(err)
+            }
+
+            const succeed = (buffer: Buffer): void => {
+                if (isSettled) return
+                isSettled = true
+                cleanup()
+                resolve(buffer)
+            }
+
+            const cleanup = (): void => {
+                stream.removeListener('data', onData)
+                stream.removeListener('error', onError)
+                stream.removeListener('end', onEnd)
+            }
+
+            const onData = (chunk: Buffer | string): void => {
+                const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+                totalBytes += chunkBuffer.length
+                if (totalBytes > maxBytes) {
+                    const overflowError = new Error(
+                        `MinerU precision mode markdown content too large for ${source} (limit: ${maxBytes} bytes)`
+                    )
+                    const streamWithDestroy = stream as NodeJS.ReadableStream & { destroy?: (error?: Error) => void }
+                    if (typeof streamWithDestroy.destroy === 'function') {
+                        streamWithDestroy.destroy(overflowError)
+                    } else {
+                        fail(overflowError)
+                    }
+                    return
+                }
+                chunks.push(chunkBuffer)
+            }
+
+            const onError = (err: Error): void => {
+                fail(err)
+            }
+
+            const onEnd = (): void => {
+                succeed(Buffer.concat(chunks, totalBytes))
+            }
+
+            stream.on('data', onData)
+            stream.on('error', onError)
+            stream.on('end', onEnd)
+        })
+    }
+
+    private isMarkdownEntry(fileName: string): boolean {
+        return fileName.toLowerCase().endsWith('.md')
     }
 
     private buildAccurateOptions(config: MinerUPrecisionConfig, pageRange?: string): Record<string, unknown> {
