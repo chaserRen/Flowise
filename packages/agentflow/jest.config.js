@@ -47,12 +47,14 @@ module.exports = {
         './src/atoms/ArrayInput.tsx': { branches: 80, functions: 80, lines: 80, statements: 80 },
         './src/atoms/ExpandTextDialog.tsx': { branches: 80, functions: 80, lines: 80, statements: 80 },
         './src/atoms/MessagesInput.tsx': { branches: 80, functions: 80, lines: 80, statements: 80 },
+        './src/atoms/ScenariosInput.tsx': { branches: 80, functions: 80, lines: 80, statements: 80 },
         // Tier 3 UI atom — only the onChange/disabled/sync logic is tested, not styled internals
         './src/atoms/RichTextEditor.tsx': { branches: 30, functions: 50, lines: 50, statements: 50 },
         './src/core/': { branches: 80, functions: 80, lines: 80, statements: 80 },
         './src/features/canvas/components/ConnectionLine.tsx': { branches: 80, functions: 80, lines: 80, statements: 80 },
         // Only getMinimumNodeHeight() is tested; the component is Tier 3 UI with no business logic
         './src/features/canvas/components/NodeOutputHandles.tsx': { branches: 0, functions: 10, lines: 30, statements: 30 },
+        './src/features/canvas/containers/NodeInfoDialog.tsx': { branches: 80, functions: 80, lines: 80, statements: 80 },
         './src/features/canvas/hooks/': { branches: 80, functions: 80, lines: 80, statements: 80 },
         './src/features/generator/GenerateFlowDialog.tsx': { branches: 80, functions: 80, lines: 80, statements: 80 },
         './src/features/node-editor/': { branches: 80, functions: 80, lines: 80, statements: 80 },
